@@ -33,6 +33,7 @@
 #include <stdlib.h>
 #include <libmtd.h>
 #include <getopt.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <fcntl.h>
 #include <time.h>
@@ -46,7 +47,7 @@ static const char *mtddev;
 static libmtd_t mtd_desc;
 static int fd;
 
-static int peb=-1, count=-1, skip=-1, flags=0;
+static int peb=-1, count=-1, skip=-1, flags=0, speb=-1;
 static struct timespec start, finish;
 static int pgsize, pgcnt;
 static int goodebcnt;
@@ -57,6 +58,7 @@ static const struct option options[] = {
 	{ "peb", required_argument, NULL, 'b' },
 	{ "count", required_argument, NULL, 'c' },
 	{ "skip", required_argument, NULL, 's' },
+	{ "sec-bank", required_argument, NULL, 'k' },
 	{ NULL, 0, NULL, 0 },
 };
 
@@ -69,7 +71,8 @@ static NORETURN void usage(int status)
 	"  -b, --peb <num>     Start from this physical erase block\n"
 	"  -c, --count <num>   Number of erase blocks to use (default: all)\n"
 	"  -s, --skip <num>    Number of blocks to skip\n"
-	"  -d, --destructive   Run destructive (erase and write speed) tests\n",
+	"  -d, --destructive   Run destructive (erase and write speed) tests\n"
+	"  -k, --sec-bank <num> Start of second bank to use for RWW latencies (requires -d)\n",
 	status==EXIT_SUCCESS ? stdout : stderr);
 	exit(status);
 }
@@ -93,7 +96,7 @@ static void process_options(int argc, char **argv)
 	int c;
 
 	while (1) {
-		c = getopt_long(argc, argv, "hb:c:s:d", options, NULL);
+		c = getopt_long(argc, argv, "hb:c:s:dk:", options, NULL);
 		if (c == -1)
 			break;
 
@@ -126,6 +129,13 @@ static void process_options(int argc, char **argv)
 				goto failmulti;
 			flags |= DESTRUCTIVE;
 			break;
+		case 'k':
+			if (speb >= 0)
+				goto failmulti;
+			speb = read_num(c, optarg);
+			if (speb < 0)
+				goto failarg;
+			break;
 		default:
 			exit(EXIT_FAILURE);
 		}
@@ -144,6 +154,8 @@ static void process_options(int argc, char **argv)
 		skip = 0;
 	if (count < 0)
 		count = 1;
+	if (speb > 0 && !(flags & DESTRUCTIVE))
+		goto failarg;
 	return;
 failmulti:
 	errmsg_die("'-%c' specified more than once!\n", c);
@@ -268,12 +280,22 @@ static void stop_timing(void)
 	clock_gettime(CLOCK_MONOTONIC_RAW, &finish);
 }
 
-static long calc_speed(void)
+static long calc_duration(void)
 {
 	long ms;
 
 	ms = (finish.tv_sec - start.tv_sec) * 1000L;
 	ms += (finish.tv_nsec - start.tv_nsec) / 1000000L;
+
+	if (ms <= 0)
+		return 0;
+
+	return ms;
+}
+
+static long calc_speed(void)
+{
+	long ms = calc_duration();
 
 	if (ms <= 0)
 		return 0;
@@ -313,6 +335,28 @@ static int erase_good_eraseblocks(unsigned int eb, int ebcnt, int ebskip)
 	return err;
 }
 
+struct thread_arg {
+	int (*op)(int peb);
+	int peb;
+};
+
+static void *op_thread(void *ptr)
+{
+	const struct thread_arg *args = ptr;
+	unsigned long err = 0;
+	int i;
+
+	for (i = 0; i < count; ++i) {
+		if (bbt[i])
+			continue;
+		err = args->op(args->peb + i * (skip + 1));
+		if (err)
+			break;
+	}
+
+	return (void *)err;
+}
+
 #define TIME_OP_PER_PEB( op )\
 		start_timing();\
 		for (i = 0; i < count; ++i) {\
@@ -328,7 +372,7 @@ static int erase_good_eraseblocks(unsigned int eb, int ebcnt, int ebskip)
 int main(int argc, char **argv)
 {
 	int err, i, blocks, j, k, status = EXIT_FAILURE;
-	long speed;
+	long speed, duration, latency;
 
 	process_options(argc, argv);
 
@@ -375,6 +419,86 @@ int main(int argc, char **argv)
 	for (i = 0; i < count; ++i) {
 		if (!bbt[i])
 			goodebcnt++;
+	}
+
+	/* Write 1 page then immediately after read 1 page, report the latency difference when performed on different banks */
+	if (flags & DESTRUCTIVE) {
+		struct thread_arg write_args = {
+			.op = write_eraseblock,
+			.peb = peb,
+		};
+		struct thread_arg read_args = {
+			.op = read_eraseblock,
+			.peb = speb,
+		};
+		pthread_t write_thread, read_thread;
+		void *retval;
+
+		err = erase_good_eraseblocks(peb, 1, skip);
+		if (err)
+			goto out;
+
+		err = erase_good_eraseblocks(speb, 1, skip);
+		if (err)
+			goto out;
+
+		puts("testing read while write latency");
+
+		/* Serialized measure */
+		start_timing();
+
+		err = pthread_create(&write_thread, NULL, &op_thread, &write_args);
+		if (err) {
+			errmsg("1st write pthread create failed");
+			goto out;
+		}
+		pthread_join(write_thread, &retval);
+		if ((long)retval) {
+			errmsg("1st write pthread failed");
+			goto out;
+		}
+
+		err = pthread_create(&read_thread, NULL, (void *)op_thread, &read_args);
+		if (err) {
+			errmsg("1st read pthread create failed");
+			goto out;
+		}
+		pthread_join(read_thread, &retval);
+		if ((long)retval) {
+			errmsg("1st read pthread failed");
+			goto out;
+		}
+
+		stop_timing();
+		duration = calc_duration();
+		start_timing();
+
+		err = pthread_create(&write_thread, NULL, (void *)op_thread, &write_args);
+		if (err) {
+			errmsg("2nd write pthread create failed");
+			goto out;
+		}
+		err = pthread_create(&read_thread, NULL, (void *)op_thread, &read_args);
+		if (err) {
+			errmsg("2nd read pthread create failed");
+			goto out;
+		}
+
+		pthread_join(write_thread, &retval);
+		if ((long)retval) {
+			errmsg("2nd write pthread failed");
+			goto out;
+		}
+		pthread_join(read_thread, &retval);
+		if ((long)retval) {
+			errmsg("2nd read pthread failed");
+			goto out;
+		}
+
+		stop_timing();
+		latency = duration - calc_duration();
+		printf("eraseblock read while write latency is %ldms vs. %ldms\n",
+		       latency, duration);
 	}
 
 	/* Write all eraseblocks, 1 eraseblock at a time */
